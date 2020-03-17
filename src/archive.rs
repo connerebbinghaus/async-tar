@@ -4,22 +4,21 @@ use std::{
     pin::Pin,
 };
 
-use async_std::{
+use futures::{
     io,
-    io::prelude::*,
-    path::Path,
     prelude::*,
     stream::Stream,
-    sync::Arc,
     task::{Context, Poll},
 };
+
+use std::sync::Arc;
+
 use pin_project::pin_project;
 
 use crate::pin_cell::PinCell;
 
 use crate::{
     entry::{EntryFields, EntryIo},
-    error::TarError,
     other, Entry, GnuExtSparseHeader, GnuSparseHeader, Header,
 };
 
@@ -27,11 +26,11 @@ use crate::{
 ///
 /// This archive can have an entry added to it and it can be iterated over.
 #[derive(Debug)]
-pub struct Archive<R: Read + Unpin> {
+pub struct Archive<R: AsyncRead + Unpin> {
     inner: Arc<ArchiveInner<R>>,
 }
 
-impl<R: Read + Unpin> Clone for Archive<R> {
+impl<R: AsyncRead + Unpin> Clone for Archive<R> {
     fn clone(&self) -> Self {
         Archive {
             inner: self.inner.clone(),
@@ -52,7 +51,7 @@ pub struct ArchiveInner<R> {
 }
 
 /// Configure the archive.
-pub struct ArchiveBuilder<R: Read + Unpin> {
+pub struct ArchiveBuilder<R: AsyncRead + Unpin> {
     obj: PinCell<R>,
     unpack_xattrs: bool,
     preserve_permissions: bool,
@@ -60,7 +59,7 @@ pub struct ArchiveBuilder<R: Read + Unpin> {
     ignore_zeros: bool,
 }
 
-impl<R: Read + Unpin> ArchiveBuilder<R> {
+impl<R: AsyncRead + Unpin> ArchiveBuilder<R> {
     /// Create a new builder.
     pub fn new(obj: R) -> Self {
         ArchiveBuilder {
@@ -135,7 +134,7 @@ impl<R: Read + Unpin> ArchiveBuilder<R> {
     }
 }
 
-impl<R: Read + Unpin + Sync + Send> Archive<R> {
+impl<R: AsyncRead + Unpin + Sync + Send> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
@@ -205,43 +204,10 @@ impl<R: Read + Unpin + Sync + Send> Archive<R> {
             next: 0,
         })
     }
-
-    /// Unpacks the contents tarball into the specified `dst`.
-    ///
-    /// This function will iterate over the entire contents of this tarball,
-    /// extracting each file in turn to the location specified by the entry's
-    /// path name.
-    ///
-    /// This operation is relatively sensitive in that it will not write files
-    /// outside of the path specified by `dst`. Files in the archive which have
-    /// a '..' in their path are skipped during the unpacking process.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { async_std::task::block_on(async {
-    /// #
-    /// use async_std::fs::File;
-    /// use async_tar::Archive;
-    ///
-    /// let mut ar = Archive::new(File::open("foo.tar").await?);
-    /// ar.unpack("foo").await?;
-    /// #
-    /// # Ok(()) }) }
-    /// ```
-    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        let mut entries = self.entries()?;
-        let mut pinned = Pin::new(&mut entries);
-        while let Some(entry) = pinned.next().await {
-            let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
-            file.unpack_in(dst.as_ref()).await?;
-        }
-        Ok(())
-    }
 }
 
 /// Stream of `Entry`s.
-pub struct Entries<R: Read + Unpin> {
+pub struct Entries<R: AsyncRead + Unpin> {
     archive: Archive<R>,
     next: u64,
     gnu_longname: Option<Vec<u8>>,
@@ -251,7 +217,7 @@ pub struct Entries<R: Read + Unpin> {
 
 macro_rules! ready_opt_err {
     ($val:expr) => {
-        match async_std::task::ready!($val) {
+        match futures::ready!($val) {
             Some(Ok(val)) => val,
             Some(Err(err)) => return Poll::Ready(Some(Err(err))),
             None => return Poll::Ready(None),
@@ -261,14 +227,14 @@ macro_rules! ready_opt_err {
 
 macro_rules! ready_err {
     ($val:expr) => {
-        match async_std::task::ready!($val) {
+        match futures::ready!($val) {
             Ok(val) => val,
             Err(err) => return Poll::Ready(Some(Err(err))),
         }
     };
 }
 
-impl<R: Read + Unpin> Stream for Entries<R> {
+impl<R: AsyncRead + Unpin> Stream for Entries<R> {
     type Item = io::Result<Entry<Archive<R>>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -335,12 +301,12 @@ impl<R: Read + Unpin> Stream for Entries<R> {
 }
 
 /// Stream of raw `Entry`s.
-pub struct RawEntries<R: Read + Unpin> {
+pub struct RawEntries<R: AsyncRead + Unpin> {
     archive: Archive<R>,
     next: u64,
 }
 
-impl<R: Read + Unpin> Stream for RawEntries<R> {
+impl<R: AsyncRead + Unpin> Stream for RawEntries<R> {
     type Item = io::Result<Entry<Archive<R>>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -348,7 +314,7 @@ impl<R: Read + Unpin> Stream for RawEntries<R> {
     }
 }
 
-fn poll_next_raw<R: Read + Unpin>(
+fn poll_next_raw<R: AsyncRead + Unpin>(
     mut archive: Archive<R>,
     next: &mut u64,
     cx: &mut Context<'_>,
@@ -360,13 +326,13 @@ fn poll_next_raw<R: Read + Unpin>(
         // Seek to the start of the next header in the archive
         let delta = *next - archive.inner.pos.get();
 
-        match async_std::task::ready!(poll_skip(&mut archive, cx, delta)) {
+        match futures::ready!(poll_skip(&mut archive, cx, delta)) {
             Ok(_) => {}
             Err(err) => return Poll::Ready(Some(Err(err))),
         }
 
         // EOF is an indicator that we are at the end of the archive.
-        match async_std::task::ready!(poll_try_read_all(&mut archive, cx, header.as_mut_bytes())) {
+        match futures::ready!(poll_try_read_all(&mut archive, cx, header.as_mut_bytes())) {
             Ok(true) => {}
             Ok(false) => return Poll::Ready(None),
             Err(err) => return Poll::Ready(Some(Err(err))),
@@ -427,7 +393,7 @@ fn poll_next_raw<R: Read + Unpin>(
     Poll::Ready(Some(Ok(ret.into_entry())))
 }
 
-fn poll_parse_sparse_header<R: Read + Unpin>(
+fn poll_parse_sparse_header<R: AsyncRead + Unpin>(
     mut archive: Archive<R>,
     next: &mut u64,
     entry: &mut EntryFields<Archive<R>>,
@@ -509,7 +475,7 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
             let mut ext = GnuExtSparseHeader::new();
             ext.isextended[0] = 1;
             while ext.is_extended() {
-                match async_std::task::ready!(poll_try_read_all(
+                match futures::ready!(poll_try_read_all(
                     &mut archive,
                     cx,
                     ext.as_mut_bytes()
@@ -543,7 +509,7 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
     Poll::Ready(Ok(()))
 }
 
-impl<R: Read + Unpin> Read for Archive<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for Archive<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -552,7 +518,7 @@ impl<R: Read + Unpin> Read for Archive<R> {
         let mut r = Pin::new(&Pin::new(&mut &*self.inner).obj).borrow_mut();
 
         let res =
-            async_std::task::ready!(crate::pin_cell::PinMut::as_mut(&mut r).poll_read(cx, into));
+            futures::ready!(crate::pin_cell::PinMut::as_mut(&mut r).poll_read(cx, into));
         match res {
             Ok(i) => {
                 self.inner.pos.set(self.inner.pos.get() + i as u64);
@@ -567,14 +533,14 @@ impl<R: Read + Unpin> Read for Archive<R> {
 ///
 /// If the reader reaches its end before filling the buffer at all, returns `false`.
 /// Otherwise returns `true`.
-fn poll_try_read_all<R: Read + Unpin>(
+fn poll_try_read_all<R: AsyncRead + Unpin>(
     mut source: R,
     cx: &mut Context<'_>,
     buf: &mut [u8],
 ) -> Poll<io::Result<bool>> {
     let mut read = 0;
     while read < buf.len() {
-        match async_std::task::ready!(Pin::new(&mut source).poll_read(cx, &mut buf[read..])) {
+        match futures::ready!(Pin::new(&mut source).poll_read(cx, &mut buf[read..])) {
             Ok(0) => {
                 if read == 0 {
                     return Poll::Ready(Ok(false));
@@ -591,7 +557,7 @@ fn poll_try_read_all<R: Read + Unpin>(
 }
 
 /// Skip n bytes on the given source.
-fn poll_skip<R: Read + Unpin>(
+fn poll_skip<R: AsyncRead + Unpin>(
     mut source: R,
     cx: &mut Context<'_>,
     mut amt: u64,
@@ -599,7 +565,7 @@ fn poll_skip<R: Read + Unpin>(
     let mut buf = [0u8; 4096 * 8];
     while amt > 0 {
         let n = cmp::min(amt, buf.len() as u64);
-        match async_std::task::ready!(Pin::new(&mut source).poll_read(cx, &mut buf[..n as usize])) {
+        match futures::ready!(Pin::new(&mut source).poll_read(cx, &mut buf[..n as usize])) {
             Ok(n) if n == 0 => {
                 return Poll::Ready(Err(other("unexpected EOF during skip")));
             }

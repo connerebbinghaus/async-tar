@@ -5,10 +5,11 @@ use std::os::windows::prelude::*;
 
 use std::{borrow::Cow, fmt, iter, iter::repeat, mem, str};
 
-use async_std::{
-    fs, io,
-    path::{Component, Path, PathBuf},
+use futures::{
+    io,
 };
+
+use std::path::{Component, Path, PathBuf};
 
 use crate::{other, EntryType};
 
@@ -267,22 +268,6 @@ impl Header {
     /// Returns a view into this header as a byte array.
     pub fn as_mut_bytes(&mut self) -> &mut [u8; 512] {
         &mut self.bytes
-    }
-
-    /// Blanket sets the metadata in this header from the metadata argument
-    /// provided.
-    ///
-    /// This is useful for initializing a `Header` from the OS's metadata from a
-    /// file. By default, this will use `HeaderMode::Complete` to include all
-    /// metadata.
-    pub fn set_metadata(&mut self, meta: &fs::Metadata) {
-        self.fill_from(meta, HeaderMode::Complete);
-    }
-
-    /// Sets only the metadata relevant to the given HeaderMode in this header
-    /// from the metadata argument provided.
-    pub fn set_metadata_in_mode(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        self.fill_from(meta, mode);
     }
 
     /// Returns the size of entry's data this header represents.
@@ -687,91 +672,6 @@ impl Header {
             .chain(iter::repeat(&b' ').take(len))
             .chain(&self.bytes[offset + len..])
             .fold(0, |a, b| a + (*b as u32))
-    }
-
-    fn fill_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        self.fill_platform_from(meta, mode);
-        // Set size of directories to zero
-        self.set_size(if meta.is_dir() || meta.file_type().is_symlink() {
-            0
-        } else {
-            meta.len()
-        });
-        if let Some(ustar) = self.as_ustar_mut() {
-            ustar.set_device_major(0);
-            ustar.set_device_minor(0);
-        }
-        if let Some(gnu) = self.as_gnu_mut() {
-            gnu.set_device_major(0);
-            gnu.set_device_minor(0);
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    #[allow(unused_variables)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        unimplemented!();
-    }
-
-    #[cfg(any(unix, target_os = "redox"))]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        match mode {
-            HeaderMode::Complete => {
-                self.set_mtime(meta.mtime() as u64);
-                self.set_uid(meta.uid() as u64);
-                self.set_gid(meta.gid() as u64);
-                self.set_mode(meta.mode() as u32);
-            }
-            HeaderMode::Deterministic => {
-                self.set_mtime(0);
-                self.set_uid(0);
-                self.set_gid(0);
-
-                // Use a default umask value, but propagate the (user) execute bit.
-                let fs_mode = if meta.is_dir() || (0o100 & meta.mode() == 0o100) {
-                    0o755
-                } else {
-                    0o644
-                };
-                self.set_mode(fs_mode);
-            }
-        }
-
-        // Note that if we are a GNU header we *could* set atime/ctime, except
-        // the `tar` utility doesn't do that by default and it causes problems
-        // with 7-zip [1].
-        //
-        // It's always possible to fill them out manually, so we just don't fill
-        // it out automatically here.
-        //
-        // [1]: https://github.com/alexcrichton/tar-rs/issues/70
-
-        // TODO: need to bind more file types
-        self.set_entry_type(entry_type(meta.mode()));
-
-        #[cfg(not(target_os = "redox"))]
-        fn entry_type(mode: u32) -> EntryType {
-            match mode as libc::mode_t & libc::S_IFMT {
-                libc::S_IFREG => EntryType::file(),
-                libc::S_IFLNK => EntryType::symlink(),
-                libc::S_IFCHR => EntryType::character_special(),
-                libc::S_IFBLK => EntryType::block_special(),
-                libc::S_IFDIR => EntryType::dir(),
-                libc::S_IFIFO => EntryType::fifo(),
-                _ => EntryType::new(b' '),
-            }
-        }
-
-        #[cfg(target_os = "redox")]
-        fn entry_type(mode: u32) -> EntryType {
-            use syscall;
-            match mode as u16 & syscall::MODE_TYPE {
-                syscall::MODE_FILE => EntryType::file(),
-                syscall::MODE_SYMLINK => EntryType::symlink(),
-                syscall::MODE_DIR => EntryType::dir(),
-                _ => EntryType::new(b' '),
-            }
-        }
     }
 
     #[cfg(windows)]

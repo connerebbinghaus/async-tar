@@ -19,20 +19,5 @@ contents are never required to be entirely resident in memory all at once.
 """
 
 [dependencies]
-filetime = "0.2.8"
-async-std = {version = "1.4.0", features = ["unstable"] }
 pin-project = "0.4.6"
-
-[dev-dependencies]
-tempfile = "3"
-async-std = {version = "1.4.0", features = ["unstable", "attributes"] }
-
-[target."cfg(unix)".dependencies]
-xattr = { version = "0.2", optional = true }
-libc = "0.2"
-
-[target.'cfg(target_os = "redox")'.dependencies]
-redox_syscall = "0.1"
-
-[features]
-default = ["xattr"]
+futures="0.3"

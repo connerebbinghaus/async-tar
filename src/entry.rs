@@ -5,18 +5,15 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_std::{
-    fs,
-    fs::OpenOptions,
-    io::{self, prelude::*, Error, ErrorKind, SeekFrom},
-    path::{Component, Path, PathBuf},
+use futures::{
+    io::{self, AsyncRead},
 };
+use std::path::{Path};
+
 use pin_project::{pin_project, project};
 
-use filetime::{self, FileTime};
-
 use crate::{
-    error::TarError, header::bytes2path, other, pax::pax_extensions, Archive, Header, PaxExtensions,
+    header::bytes2path, pax::pax_extensions, Archive, Header, PaxExtensions,
 };
 
 /// A read-only view into an entry of an archive.
@@ -25,13 +22,13 @@ use crate::{
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
 #[pin_project]
-pub struct Entry<R: Read + Unpin> {
+pub struct Entry<R: AsyncRead + Unpin> {
     #[pin]
     fields: EntryFields<R>,
     _ignored: marker::PhantomData<Archive<R>>,
 }
 
-impl<R: Read + Unpin> fmt::Debug for Entry<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for Entry<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
             .field("fields", &self.fields)
@@ -42,7 +39,7 @@ impl<R: Read + Unpin> fmt::Debug for Entry<R> {
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
 #[pin_project]
-pub struct EntryFields<R: Read + Unpin> {
+pub struct EntryFields<R: AsyncRead + Unpin> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
     pub pax_extensions: Option<Vec<u8>>,
@@ -59,7 +56,7 @@ pub struct EntryFields<R: Read + Unpin> {
     pub(crate) read_state: Option<EntryIo<R>>,
 }
 
-impl<R: Read + Unpin> fmt::Debug for EntryFields<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for EntryFields<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EntryFields")
             .field("long_pathname", &self.long_pathname)
@@ -79,12 +76,12 @@ impl<R: Read + Unpin> fmt::Debug for EntryFields<R> {
 }
 
 #[pin_project]
-pub enum EntryIo<R: Read + Unpin> {
+pub enum EntryIo<R: AsyncRead + Unpin> {
     Pad(#[pin] io::Take<io::Repeat>),
     Data(#[pin] io::Take<R>),
 }
 
-impl<R: Read + Unpin> fmt::Debug for EntryIo<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for EntryIo<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EntryIo::Pad(_) => write!(f, "EntryIo::Pad"),
@@ -93,19 +90,7 @@ impl<R: Read + Unpin> fmt::Debug for EntryIo<R> {
     }
 }
 
-/// When unpacking items the unpacked thing is returned to allow custom
-/// additional handling by users. Today the File is returned, in future
-/// the enum may be extended with kinds for links, directories etc.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Unpacked {
-    /// A file was unpacked.
-    File(fs::File),
-    /// A directory, hardlink, symlink, or other node was unpacked.
-    Other,
-}
-
-impl<R: Read + Unpin> Entry<R> {
+impl<R: AsyncRead + Unpin> Entry<R> {
     /// Returns the path name for this entry.
     ///
     /// This method may fail if the pathname is not valid Unicode and this is
@@ -207,81 +192,6 @@ impl<R: Read + Unpin> Entry<R> {
         self.fields.file_pos
     }
 
-    /// Writes this file to the specified location.
-    ///
-    /// This function will write the entire contents of this file into the
-    /// location specified by `dst`. Metadata will also be propagated to the
-    /// path `dst`.
-    ///
-    /// This function will create a file at the path `dst`, and it is required
-    /// that the intermediate directories are created. Any existing file at the
-    /// location `dst` will be overwritten.
-    ///
-    /// > **Note**: This function does not have as many sanity checks as
-    /// > `Archive::unpack` or `Entry::unpack_in`. As a result if you're
-    /// > thinking of unpacking untrusted tarballs you may want to review the
-    /// > implementations of the previous two functions and perhaps implement
-    /// > similar logic yourself.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { async_std::task::block_on(async {
-    /// #
-    /// use async_std::fs::File;
-    /// use async_std::prelude::*;
-    /// use async_tar::Archive;
-    ///
-    /// let mut ar = Archive::new(File::open("foo.tar").await?);
-    /// let mut entries = ar.entries()?;
-    /// let mut i = 0;
-    /// while let Some(file) = entries.next().await {
-    ///     let mut file = file?;
-    ///     file.unpack(format!("file-{}", i)).await?;
-    ///     i += 1;
-    /// }
-    /// #
-    /// # Ok(()) }) }
-    /// ```
-    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
-        self.fields.unpack(None, dst.as_ref()).await
-    }
-
-    /// Extracts this file under the specified path, avoiding security issues.
-    ///
-    /// This function will write the entire contents of this file into the
-    /// location obtained by appending the path of this file in the archive to
-    /// `dst`, creating any intermediate directories if needed. Metadata will
-    /// also be propagated to the path `dst`. Any existing file at the location
-    /// `dst` will be overwritten.
-    ///
-    /// This function carefully avoids writing outside of `dst`. If the file has
-    /// a '..' in its path, this function will skip it and return false.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { async_std::task::block_on(async {
-    /// #
-    /// use async_std::fs::File;
-    /// use async_tar::Archive;
-    /// use async_std::prelude::*;
-    ///
-    /// let mut ar = Archive::new(File::open("foo.tar").await?);
-    /// let mut entries = ar.entries()?;
-    /// let mut i = 0;
-    /// while let Some(file) = entries.next().await {
-    ///     let mut file = file.unwrap();
-    ///     file.unpack_in("target").await?;
-    ///     i += 1;
-    /// }
-    /// #
-    /// # Ok(()) }) }
-    /// ```
-    pub async fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
-        self.fields.unpack_in(dst.as_ref()).await
-    }
-
     /// Indicate whether extended file attributes (xattrs on Unix) are preserved
     /// when unpacking this entry.
     ///
@@ -311,7 +221,7 @@ impl<R: Read + Unpin> Entry<R> {
     }
 }
 
-impl<R: Read + Unpin> Read for Entry<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for Entry<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -322,7 +232,7 @@ impl<R: Read + Unpin> Read for Entry<R> {
     }
 }
 
-impl<R: Read + Unpin> EntryFields<R> {
+impl<R: AsyncRead + Unpin> EntryFields<R> {
     pub fn from(entry: Entry<R>) -> Self {
         entry.fields
     }
@@ -343,13 +253,14 @@ impl<R: Read + Unpin> EntryFields<R> {
         let mut buf = Vec::with_capacity(cap as usize);
 
         // Copied from futures::ReadToEnd
-        match async_std::task::ready!(poll_read_all_internal(self, cx, &mut buf)) {
+        match futures::ready!(poll_read_all_internal(self, cx, &mut buf)) {
             Ok(_) => Poll::Ready(Ok(buf)),
             Err(err) => Poll::Ready(Err(err)),
         }
     }
 
     pub async fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        use futures::io::AsyncReadExt;
         // Preallocate some data but don't let ourselves get too crazy now.
         let cap = cmp::min(self.size, 128 * 1024);
         let mut v = Vec::with_capacity(cap as usize);
@@ -384,11 +295,6 @@ impl<R: Read + Unpin> EntryFields<R> {
         }
     }
 
-    /// Gets the path in a "lossy" way, used for error reporting ONLY.
-    fn path_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.path_bytes()).to_string()
-    }
-
     fn link_name(&self) -> io::Result<Option<Cow<Path>>> {
         match self.link_name_bytes() {
             Some(bytes) => bytes2path(bytes).map(Some),
@@ -420,438 +326,9 @@ impl<R: Read + Unpin> EntryFields<R> {
         }
         Ok(Some(pax_extensions(self.pax_extensions.as_ref().unwrap())))
     }
-
-    async fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
-        // Notes regarding bsdtar 2.8.3 / libarchive 2.8.3:
-        // * Leading '/'s are trimmed. For example, `///test` is treated as
-        //   `test`.
-        // * If the filename contains '..', then the file is skipped when
-        //   extracting the tarball.
-        // * '//' within a filename is effectively skipped. An error is
-        //   logged, but otherwise the effect is as if any two or more
-        //   adjacent '/'s within the filename were consolidated into one
-        //   '/'.
-        //
-        // Most of this is handled by the `path` module of the standard
-        // library, but we specially handle a few cases here as well.
-
-        let mut file_dst = dst.to_path_buf();
-        {
-            let path = self.path().map_err(|e| {
-                TarError::new(
-                    &format!("invalid path in entry header: {}", self.path_lossy()),
-                    e,
-                )
-            })?;
-            for part in path.components() {
-                match part {
-                    // Leading '/' characters, root paths, and '.'
-                    // components are just ignored and treated as "empty
-                    // components"
-                    Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
-
-                    // If any part of the filename is '..', then skip over
-                    // unpacking the file to prevent directory traversal
-                    // security issues.  See, e.g.: CVE-2001-1267,
-                    // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
-                    Component::ParentDir => return Ok(false),
-
-                    Component::Normal(part) => file_dst.push(part),
-                }
-            }
-        }
-
-        // Skip cases where only slashes or '.' parts were seen, because
-        // this is effectively an empty filename.
-        if *dst == *file_dst {
-            return Ok(true);
-        }
-
-        // Skip entries without a parent (i.e. outside of FS root)
-        let parent = match file_dst.parent() {
-            Some(p) => p,
-            None => return Ok(false),
-        };
-
-        if parent.symlink_metadata().await.is_err() {
-            fs::create_dir_all(&parent).await.map_err(|e| {
-                TarError::new(&format!("failed to create `{}`", parent.display()), e)
-            })?;
-        }
-
-        let canon_target = self.validate_inside_dst(&dst, parent).await?;
-
-        self.unpack(Some(&canon_target), &file_dst)
-            .await
-            .map_err(|e| TarError::new(&format!("failed to unpack `{}`", file_dst.display()), e))?;
-
-        Ok(true)
-    }
-
-    /// Unpack as destination directory `dst`.
-    async fn unpack_dir(&mut self, dst: &Path) -> io::Result<()> {
-        // If the directory already exists just let it slide
-        match fs::create_dir(dst).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if err.kind() == ErrorKind::AlreadyExists {
-                    let prev = fs::metadata(dst).await;
-                    if prev.map(|m| m.is_dir()).unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                Err(Error::new(
-                    err.kind(),
-                    format!("{} when creating dir {}", err, dst.display()),
-                ))
-            }
-        }
-    }
-
-    /// Returns access to the header of this entry in the archive.
-    async fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
-        let kind = self.header.entry_type();
-
-        if kind.is_dir() {
-            self.unpack_dir(dst).await?;
-            if let Ok(mode) = self.header.mode() {
-                set_perms(dst, None, mode, self.preserve_permissions).await?;
-            }
-            return Ok(Unpacked::Other);
-        } else if kind.is_hard_link() || kind.is_symlink() {
-            let src = match self.link_name()? {
-                Some(name) => name,
-                None => {
-                    return Err(other(&format!(
-                        "hard link listed for {} but no link name found",
-                        String::from_utf8_lossy(self.header.as_bytes())
-                    )));
-                }
-            };
-
-            if src.iter().count() == 0 {
-                return Err(other(&format!(
-                    "symlink destination for {} is empty",
-                    String::from_utf8_lossy(self.header.as_bytes())
-                )));
-            }
-
-            if kind.is_hard_link() {
-                let link_src = match target_base {
-                    // If we're unpacking within a directory then ensure that
-                    // the destination of this hard link is both present and
-                    // inside our own directory. This is needed because we want
-                    // to make sure to not overwrite anything outside the root.
-                    //
-                    // Note that this logic is only needed for hard links
-                    // currently. With symlinks the `validate_inside_dst` which
-                    // happens before this method as part of `unpack_in` will
-                    // use canonicalization to ensure this guarantee. For hard
-                    // links though they're canonicalized to their existing path
-                    // so we need to validate at this time.
-                    Some(ref p) => {
-                        let link_src = p.join(src);
-                        self.validate_inside_dst(p, &link_src).await?;
-                        link_src
-                    }
-                    None => src.into_owned(),
-                };
-                fs::hard_link(&link_src, dst).await.map_err(|err| {
-                    Error::new(
-                        err.kind(),
-                        format!(
-                            "{} when hard linking {} to {}",
-                            err,
-                            link_src.display(),
-                            dst.display()
-                        ),
-                    )
-                })?;
-            } else {
-                symlink(&src, dst).await.map_err(|err| {
-                    Error::new(
-                        err.kind(),
-                        format!(
-                            "{} when symlinking {} to {}",
-                            err,
-                            src.display(),
-                            dst.display()
-                        ),
-                    )
-                })?;
-            };
-            return Ok(Unpacked::Other);
-
-            #[cfg(target_arch = "wasm32")]
-            #[allow(unused_variables)]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-            }
-
-            #[cfg(windows)]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                async_std::os::windows::fs::symlink_file(src, dst).await
-            }
-
-            #[cfg(any(unix, target_os = "redox"))]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                async_std::os::unix::fs::symlink(src, dst).await
-            }
-        } else if kind.is_pax_global_extensions()
-            || kind.is_pax_local_extensions()
-            || kind.is_gnu_longname()
-            || kind.is_gnu_longlink()
-        {
-            return Ok(Unpacked::Other);
-        };
-
-        // Old BSD-tar compatibility.
-        // Names that have a trailing slash should be treated as a directory.
-        // Only applies to old headers.
-        if self.header.as_ustar().is_none() && self.path_bytes().ends_with(b"/") {
-            self.unpack_dir(dst).await?;
-            if let Ok(mode) = self.header.mode() {
-                set_perms(dst, None, mode, self.preserve_permissions).await?;
-            }
-            return Ok(Unpacked::Other);
-        }
-
-        // Note the lack of `else` clause above. According to the FreeBSD
-        // documentation:
-        //
-        // > A POSIX-compliant implementation must treat any unrecognized
-        // > typeflag value as a regular file.
-        //
-        // As a result if we don't recognize the kind we just write out the file
-        // as we would normally.
-
-        // Ensure we write a new file rather than overwriting in-place which
-        // is attackable; if an existing file is found unlink it.
-        async fn open(dst: &Path) -> io::Result<fs::File> {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(dst)
-                .await
-        };
-        let mut f = async {
-            let mut f = match open(dst).await {
-                Ok(f) => Ok(f),
-                Err(err) => {
-                    if err.kind() != ErrorKind::AlreadyExists {
-                        Err(err)
-                    } else {
-                        match fs::remove_file(dst).await {
-                            Ok(()) => open(dst).await,
-                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst).await,
-                            Err(e) => Err(e),
-                        }
-                    }
-                }
-            }?;
-            for io in self.data.drain(..) {
-                match io {
-                    EntryIo::Data(mut d) => {
-                        let expected = d.limit();
-                        if io::copy(&mut d, &mut f).await? != expected {
-                            return Err(other("failed to write entire file"));
-                        }
-                    }
-                    EntryIo::Pad(d) => {
-                        // TODO: checked cast to i64
-                        let to = SeekFrom::Current(d.limit() as i64);
-                        let size = f.seek(to).await?;
-                        f.set_len(size).await?;
-                    }
-                }
-            }
-            Ok::<fs::File, io::Error>(f)
-        }
-        .await
-        .map_err(|e| {
-            let header = self.header.path_bytes();
-            TarError::new(
-                &format!(
-                    "failed to unpack `{}` into `{}`",
-                    String::from_utf8_lossy(&header),
-                    dst.display()
-                ),
-                e,
-            )
-        })?;
-
-        if self.preserve_mtime {
-            if let Ok(mtime) = self.header.mtime() {
-                let mtime = FileTime::from_unix_time(mtime as i64, 0);
-                filetime::set_file_times(&dst, mtime, mtime).map_err(|e| {
-                    TarError::new(&format!("failed to set mtime for `{}`", dst.display()), e)
-                })?;
-            }
-        }
-        if let Ok(mode) = self.header.mode() {
-            set_perms(dst, Some(&mut f), mode, self.preserve_permissions).await?;
-        }
-        if self.unpack_xattrs {
-            set_xattrs(self, dst).await?;
-        }
-        return Ok(Unpacked::File(f));
-
-        async fn set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            preserve: bool,
-        ) -> Result<(), TarError> {
-            _set_perms(dst, f, mode, preserve).await.map_err(|e| {
-                TarError::new(
-                    &format!(
-                        "failed to set permissions to {:o} \
-                         for `{}`",
-                        mode,
-                        dst.display()
-                    ),
-                    e,
-                )
-            })
-        }
-
-        #[cfg(any(unix, target_os = "redox"))]
-        async fn _set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            preserve: bool,
-        ) -> io::Result<()> {
-            use std::os::unix::prelude::*;
-
-            let mode = if preserve { mode } else { mode & 0o777 };
-            let perm = fs::Permissions::from_mode(mode as _);
-            match f {
-                Some(f) => f.set_permissions(perm).await,
-                None => fs::set_permissions(dst, perm).await,
-            }
-        }
-
-        #[cfg(windows)]
-        async fn _set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            if mode & 0o200 == 0o200 {
-                return Ok(());
-            }
-            match f {
-                Some(f) => {
-                    let mut perm = f.metadata().await?.permissions();
-                    perm.set_readonly(true);
-                    f.set_permissions(perm).await
-                }
-                None => {
-                    let mut perm = fs::metadata(dst).await?.permissions();
-                    perm.set_readonly(true);
-                    fs::set_permissions(dst, perm).await
-                }
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        #[allow(unused_variables)]
-        async fn _set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-        }
-
-        #[cfg(all(unix, feature = "xattr"))]
-        async fn set_xattrs<R: Read + Unpin>(
-            me: &mut EntryFields<R>,
-            dst: &Path,
-        ) -> io::Result<()> {
-            use std::{ffi::OsStr, os::unix::prelude::*};
-
-            let exts = match me.pax_extensions().await {
-                Ok(Some(e)) => e,
-                _ => return Ok(()),
-            };
-            let exts = exts
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let key = e.key_bytes();
-                    let prefix = b"SCHILY.xattr.";
-                    if key.starts_with(prefix) {
-                        Some((&key[prefix.len()..], e))
-                    } else {
-                        None
-                    }
-                })
-                .map(|(key, e)| (OsStr::from_bytes(key), e.value_bytes()));
-
-            for (key, value) in exts {
-                xattr::set(dst, key, value).map_err(|e| {
-                    TarError::new(
-                        &format!(
-                            "failed to set extended \
-                             attributes to {}. \
-                             Xattrs: key={:?}, value={:?}.",
-                            dst.display(),
-                            key,
-                            String::from_utf8_lossy(value)
-                        ),
-                        e,
-                    )
-                })?;
-            }
-
-            Ok(())
-        }
-        // Windows does not completely support posix xattrs
-        // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(
-            windows,
-            target_os = "redox",
-            not(feature = "xattr"),
-            target_arch = "wasm32"
-        ))]
-        async fn set_xattrs<R: Read + Unpin>(_: &mut EntryFields<R>, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    async fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
-        // Abort if target (canonical) parent is outside of `dst`
-        let canon_parent = file_dst.canonicalize().await.map_err(|err| {
-            Error::new(
-                err.kind(),
-                format!("{} while canonicalizing {}", err, file_dst.display()),
-            )
-        })?;
-        let canon_target = dst.canonicalize().await.map_err(|err| {
-            Error::new(
-                err.kind(),
-                format!("{} while canonicalizing {}", err, dst.display()),
-            )
-        })?;
-        if !canon_parent.starts_with(&canon_target) {
-            let err = TarError::new(
-                &format!(
-                    "trying to unpack outside of destination path: {}",
-                    canon_target.display()
-                ),
-                // TODO: use ErrorKind::InvalidInput here? (minor breaking change)
-                Error::new(ErrorKind::Other, "Invalid argument"),
-            );
-            return Err(err.into());
-        }
-        Ok(canon_target)
-    }
 }
 
-impl<R: Read + Unpin> Read for EntryFields<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for EntryFields<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -896,7 +373,7 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
     }
 }
 
-impl<R: Read + Unpin> Read for EntryIo<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for EntryIo<R> {
     #[project]
     fn poll_read(
         self: Pin<&mut Self>,
@@ -924,7 +401,7 @@ impl Drop for Guard<'_> {
     }
 }
 
-fn poll_read_all_internal<R: Read + ?Sized>(
+fn poll_read_all_internal<R: AsyncRead + ?Sized>(
     mut rd: Pin<&mut R>,
     cx: &mut Context<'_>,
     buf: &mut Vec<u8>,
@@ -946,7 +423,7 @@ fn poll_read_all_internal<R: Read + ?Sized>(
             }
         }
 
-        match async_std::task::ready!(rd.as_mut().poll_read(cx, &mut g.buf[g.len..])) {
+        match futures::ready!(rd.as_mut().poll_read(cx, &mut g.buf[g.len..])) {
             Ok(0) => {
                 ret = Poll::Ready(Ok(g.len));
                 break;
